@@ -1,0 +1,303 @@
+name: Deploy — cspringghcr8
+
+on:
+  workflow_dispatch:
+
+# Force all actions to run on Node.js 24 to avoid Node 20 deprecation warnings
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: mvn test -q
+
+  build_push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set image tag
+        id: meta
+        run: echo "image=ghcr.io/${{ github.repository_owner }}/cspringghcr8:${{ github.sha }}" >> $GITHUB_OUTPUT
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image }} .
+          docker push ${{ steps.meta.outputs.image }}
+
+  build:
+    name: Build JAR
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build with Maven
+        run: mvn package -DskipTests -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: target/*.jar
+          retention-days: 1
+
+  provision:
+    name: Provision EC2 (Terraform)
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.ip }}
+      # Note: we deliberately publish ONLY the endpoint + port here, NOT a
+      # full database_url containing the password. GHA scrubs outputs that
+      # contain registered secrets, which previously caused
+      # needs.provision.outputs.database_url to silently arrive empty in the
+      # configure job. The configure job rebuilds the URL itself using
+      # secrets.DB_PASSWORD directly.
+      rds_endpoint: ${{ steps.get_rds.outputs.endpoint }}
+      rds_port:     ${{ steps.get_rds.outputs.port }}
+      db_name:      ${{ steps.get_rds.outputs.db_name }}
+      db_username:  ${{ steps.get_rds.outputs.db_username }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Check existing EC2
+        id: check_ec2
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          EXISTING_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=$PROJECT" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text 2>/dev/null || echo "None")
+          KEY_EXISTS=$(aws ec2 describe-key-pairs \
+            --filters "Name=key-name,Values=$PROJECT-key" \
+            --query "KeyPairs[0].KeyName" --output text 2>/dev/null || echo "None")
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$PROJECT-sg" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          [ "$EXISTING_IP" != "None" ] && echo "exists=true" >> $GITHUB_OUTPUT || echo "exists=false" >> $GITHUB_OUTPUT
+          echo "ip=$EXISTING_IP" >> $GITHUB_OUTPUT
+          echo "key_exists=$KEY_EXISTS" >> $GITHUB_OUTPUT
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+      - name: Create S3 state bucket
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+      - name: Terraform init
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Import existing resources
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          KEY="${{ steps.check_ec2.outputs.key_exists }}"
+          SG="${{ steps.check_ec2.outputs.sg_id }}"
+          [ "$KEY" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            aws_key_pair.deployer "${{ secrets.PROJECT_NAME }}-key" 2>/dev/null || true
+          [ "$SG" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            aws_security_group.sg "$SG" 2>/dev/null || true
+      - name: Terraform plan
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          EXTRA_ARGS=()
+          [ -n "$DB_NAME" ]     && EXTRA_ARGS+=(-var "db_name=$DB_NAME")
+          [ -n "$DB_USERNAME" ] && EXTRA_ARGS+=(-var "db_username=$DB_USERNAME")
+          [ -n "$DB_PASSWORD" ] && EXTRA_ARGS+=(-var "db_password=$DB_PASSWORD")
+          terraform plan \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            "${EXTRA_ARGS[@]}" \
+            -out=tfplan
+      - name: Terraform apply
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+      - name: Get server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          if [ "${{ steps.check_ec2.outputs.exists }}" == "true" ]; then
+            echo "ip=${{ steps.check_ec2.outputs.ip }}" >> $GITHUB_OUTPUT
+          else
+            echo "ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Get RDS endpoint
+        id: get_rds
+        working-directory: terraform
+        env:
+          DEFAULT_PORT: "5432"
+        run: |
+          ENDPOINT=""
+          PORT=""
+          if [ "${{ steps.check_ec2.outputs.exists }}" != "true" ]; then
+            ENDPOINT=$(terraform output -raw rds_endpoint 2>/dev/null || echo "")
+            PORT=$(terraform output -raw rds_port 2>/dev/null || echo "")
+          fi
+          # Fall back to a tag-based AWS lookup when the TF outputs are not
+          # available (re-deploys against a pre-existing RDS, or import path).
+          # We pull all DB instances and filter with jq — that's far more
+          # forgiving than a JMESPath --query that errors when TagList is null
+          # or when describe-db-tags hasn't propagated yet.
+          if [ -z "$ENDPOINT" ]; then
+            PROJECT="${{ secrets.PROJECT_NAME }}"
+            ALL_INSTANCES=$(aws rds describe-db-instances --output json 2>&1) || {
+              echo "::warning title=RDS describe failed::$ALL_INSTANCES"
+              ALL_INSTANCES='{"DBInstances":[]}'
+            }
+            MATCH=$(echo "$ALL_INSTANCES" | jq -r --arg p "$PROJECT" \
+              '.DBInstances[]
+                 | select(
+                     (.DBInstanceIdentifier == ($p + "-db"))
+                     or (.DBInstanceIdentifier == $p)
+                     or ((.TagList // []) | any(.Key == "Project" and .Value == $p))
+                   )
+                 | [.Endpoint.Address, (.Endpoint.Port|tostring)]
+                 | @tsv' \
+              | head -n 1)
+            if [ -n "$MATCH" ]; then
+              ENDPOINT=$(printf '%s' "$MATCH" | cut -f1)
+              PORT=$(printf '%s' "$MATCH" | cut -f2)
+            fi
+          fi
+          PORT="${PORT:-$DEFAULT_PORT}"
+          if [ -z "$ENDPOINT" ]; then
+            echo "::error title=RDS endpoint missing::Could not resolve RDS endpoint for project ${{ secrets.PROJECT_NAME }}. Refusing to emit a localhost DATABASE_URL."
+            exit 1
+          fi
+          DB_NAME="${{ secrets.DB_NAME }}"
+          DB_USER="${{ secrets.DB_USERNAME }}"
+          DB_NAME="${DB_NAME:-$(echo "${{ secrets.PROJECT_NAME }}" | tr '-' '_')db}"
+          DB_USER="${DB_USER:-appuser}"
+          # Publish non-secret pieces only. GHA strips registered secrets
+          # (DB_PASSWORD) from job outputs, so the configure job rebuilds
+          # the full URL itself.
+          echo "endpoint=$ENDPOINT"     >> $GITHUB_OUTPUT
+          echo "port=$PORT"             >> $GITHUB_OUTPUT
+          echo "db_name=$DB_NAME"       >> $GITHUB_OUTPUT
+          echo "db_username=$DB_USER"   >> $GITHUB_OUTPUT
+
+  configure:
+    name: Configure & Deploy (Ansible)
+    runs-on: ubuntu-latest
+    needs: [provision, build_push]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: 'target'
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+      - name: Install Ansible
+        run: sudo apt-get update -qq && sudo apt-get install -y ansible
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 40); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              -i /tmp/deploy_key ${{ secrets.SSH_USER }}@${{ needs.provision.outputs.server_ip }} \
+              "cloud-init status --wait 2>/dev/null; echo ok" \
+              && break || sleep 15
+          done
+      - name: Run Ansible playbook
+        working-directory: ansible
+        env:
+          AWS_ACCESS_KEY_ID:         ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY:     ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:        ${{ secrets.AWS_REGION }}
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          # Build the full URL HERE (not in provision outputs) because GHA
+          # scrubs registered secrets from job outputs, which silently zeroed
+          # out database_url in the previous design.
+          DEPLOY_RDS_ENDPOINT: ${{ needs.provision.outputs.rds_endpoint }}
+          DEPLOY_RDS_PORT:     ${{ needs.provision.outputs.rds_port }}
+          DEPLOY_DB_NAME:      ${{ needs.provision.outputs.db_name }}
+          DEPLOY_DB_USERNAME:  ${{ needs.provision.outputs.db_username }}
+          DEPLOY_DB_PASSWORD:  ${{ secrets.DB_PASSWORD }}
+          DEPLOY_DB_TYPE:      ${{ secrets.DB_TYPE }}
+        run: |
+          # Pass DB connection details to Ansible as --extra-vars so the
+          # playbook does not rely on `lookup('env', ...)` (which silently
+          # returns empty when the env propagation chain breaks). Quoting is
+          # important: the password may contain shell metacharacters.
+          EXTRA_VARS=()
+          # Reconstruct the URL inside this step so the password never has to
+          # travel through a job output (where it would be scrubbed).
+          DEPLOY_DATABASE_URL="postgresql://${DEPLOY_DB_USERNAME}:${DEPLOY_DB_PASSWORD}@${DEPLOY_RDS_ENDPOINT}:${DEPLOY_RDS_PORT}/${DEPLOY_DB_NAME}"
+          if [ -z "$DEPLOY_RDS_ENDPOINT" ]; then
+            echo "::error title=RDS endpoint missing::provision job did not publish rds_endpoint output. Aborting before we deploy a localhost-bound app."
+            exit 1
+          fi
+          EXTRA_VARS+=(-e "deploy_database_url=${DEPLOY_DATABASE_URL}")
+          EXTRA_VARS+=(-e "deploy_db_name=${DEPLOY_DB_NAME}")
+          EXTRA_VARS+=(-e "deploy_db_username=${DEPLOY_DB_USERNAME}")
+          EXTRA_VARS+=(-e "deploy_db_password=${DEPLOY_DB_PASSWORD}")
+          EXTRA_VARS+=(-e "deploy_db_type=${DEPLOY_DB_TYPE}")
+          ansible-playbook \
+            -i "${{ needs.provision.outputs.server_ip }}," \
+            --private-key /tmp/deploy_key \
+            -u ${{ secrets.SSH_USER }} \
+            --timeout 60 \
+            -e docker_image="${{ needs.build_push.outputs.image }}" \
+            -e ghcr_actor="${{ github.actor }}" \
+            -e ghcr_token="${{ secrets.GITHUB_TOKEN }}" \
+            "${EXTRA_VARS[@]}" \
+            playbook.yml
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Wait for app to be healthy
+        run: |
+          for i in $(seq 1 12); do
+            curl -sf http://${{ needs.provision.outputs.server_ip }}/health && break || sleep 15
+          done
+
